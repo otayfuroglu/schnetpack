@@ -14,55 +14,20 @@ References
 import logging
 import os
 import warnings
+from base64 import b64encode, b64decode
 
 import numpy as np
 import torch
 from ase.db import connect
 from torch.utils.data import Dataset
 
-import schnetpack as spk
 from schnetpack import Properties
 from schnetpack.environment import SimpleEnvironmentProvider, collect_atom_triples
-
 from .partitioning import train_test_split
-from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
-__all__ = [
-    "AtomsData",
-    "AtomsDataError",
-    "AtomsConverter",
-    "get_center_of_mass",
-    "get_center_of_geometry",
-]
-
-
-def get_center_of_mass(atoms):
-    """
-    Computes center of mass.
-
-    Args:
-        atoms (ase.Atoms): atoms object of molecule
-
-    Returns:
-        center of mass
-    """
-    masses = atoms.get_masses()
-    return np.dot(masses, atoms.arrays["positions"]) / masses.sum()
-
-
-def get_center_of_geometry(atoms):
-    """
-    Computes center of geometry.
-
-    Args:
-        atoms (ase.Atoms): atoms object of molecule
-
-    Returns:
-        center of geometry
-    """
-    return atoms.arrays["positions"].mean(0)
+__all__ = ["AtomsData", "AtomsDataError", "AtomsConverter"]
 
 
 class AtomsDataError(Exception):
@@ -75,6 +40,11 @@ class AtomsData(Dataset):
     ASE database. Use together with schnetpack.data.AtomsLoader to feed data
     to your model.
 
+    To improve the performance, the data is not stored in string format,
+    as usual in the ASE database. Instead, it is encoded as binary before being written
+    to the database. Reading work both with binary-encoded as well as
+    standard ASE files.
+
     Args:
         dbpath (str): path to directory containing database.
         subset (list, optional): indices to subset. Set to None for entire database.
@@ -86,9 +56,8 @@ class AtomsData(Dataset):
             neighborhood is calculated
             (default=spk.environment.SimpleEnvironmentProvider).
         collect_triples (bool, optional): Set to True if angular features are needed.
-        centering_function (callable or None): Function for calculating center of
-            molecule (center of mass/geometry/...). Center will be subtracted from
-            positions.
+        center_positions (bool): subtract center of mass from all positions
+            (default=True)
     """
 
     ENCODING = "utf-8"
@@ -102,7 +71,7 @@ class AtomsData(Dataset):
         units=None,
         environment_provider=SimpleEnvironmentProvider(),
         collect_triples=False,
-        centering_function=get_center_of_mass,
+        center_positions=True,
     ):
         if not dbpath.endswith(".db"):
             raise AtomsDataError(
@@ -111,11 +80,6 @@ class AtomsData(Dataset):
             )
 
         self.dbpath = dbpath
-
-        # check if database is deprecated:
-        if self._is_deprecated():
-            self._deprecation_update()
-
         self.subset = subset
         self.load_only = load_only
         self.available_properties = self.get_available_properties(available_properties)
@@ -126,7 +90,7 @@ class AtomsData(Dataset):
         self.units = dict(zip(self.available_properties, units))
         self.environment_provider = environment_provider
         self.collect_triples = collect_triples
-        self.centering_function = centering_function
+        self.center_positions = center_positions
 
     def get_available_properties(self, available_properties):
         """
@@ -139,7 +103,7 @@ class AtomsData(Dataset):
             (list): all properties of the dataset
         """
         # use the provided list
-        if not os.path.exists(self.dbpath) or len(self) == 0:
+        if not os.path.exists(self.dbpath):
             if available_properties is None:
                 raise AtomsDataError(
                     "Please define available_properties or set "
@@ -150,6 +114,7 @@ class AtomsData(Dataset):
         with connect(self.dbpath) as conn:
             atmsrw = conn.get(1)
             db_properties = list(atmsrw.data.keys())
+            db_properties = [prop for prop in db_properties if not prop.startswith("_")]
         # check if properties match
         if available_properties is None or set(db_properties) == set(
             available_properties
@@ -160,6 +125,24 @@ class AtomsData(Dataset):
             "The available_properties {} do not match the "
             "properties in the database {}!".format(available_properties, db_properties)
         )
+
+    def get_name(self, idx):
+        """
+        created by otayfuroglu
+        Args:
+            idx
+
+        Returns:
+            (strıng): name
+        """
+        try:
+            idx = self._subset_index(idx)
+            with connect(self.dbpath) as conn:
+                row = conn.get(idx + 1)
+            name = row.name
+            return name
+        except:
+            print("There is no available name")
 
     def create_splits(self, num_train=None, num_val=None, split_file=None):
         warnings.warn(
@@ -188,7 +171,7 @@ class AtomsData(Dataset):
             load_only=self.load_only,
             environment_provider=self.environment_provider,
             collect_triples=self.collect_triples,
-            centering_function=self.centering_function,
+            center_positions=self.center_positions,
             available_properties=self.available_properties,
         )
 
@@ -269,19 +252,32 @@ class AtomsData(Dataset):
         metadata.update(data)
         self.set_metadata(metadata)
 
-    def _add_system(self, conn, atoms, **properties):
+    def _add_system(self, conn, atoms, name, **properties):
         data = {}
 
-        # add available properties to database
         for pname in self.available_properties:
             try:
-                data[pname] = properties[pname]
+                prop = properties[pname]
             except:
                 raise AtomsDataError("Required property missing:" + pname)
 
-        conn.write(atoms, data=data)
+            try:
+                pshape = prop.shape
+                ptype = prop.dtype
+            except:
+                raise AtomsDataError(
+                    "Required property `" + pname + "` has to be `numpy.ndarray`."
+                )
 
-    def add_system(self, atoms, **properties):
+            base64_bytes = b64encode(prop.tobytes())
+            base64_string = base64_bytes.decode(AtomsData.ENCODING)
+            data[pname] = base64_string
+            data["_shape_" + pname] = pshape
+            data["_dtype_" + pname] = str(ptype)
+
+        conn.write(atoms, name=name, data=data)
+
+    def add_system(self, atoms, name, **properties):
         """
         Add atoms data to the dataset.
 
@@ -292,9 +288,9 @@ class AtomsData(Dataset):
 
         """
         with connect(self.dbpath) as conn:
-            self._add_system(conn, atoms, **properties)
+            self._add_system(conn, atoms, name, **properties)
 
-    def add_systems(self, atoms_list, property_list):
+    def add_systems(self, atoms_list, name_list, property_list):
         """
         Add atoms data to the dataset.
 
@@ -306,8 +302,8 @@ class AtomsData(Dataset):
 
         """
         with connect(self.dbpath) as conn:
-            for at, prop in zip(atoms_list, property_list):
-                self._add_system(conn, at, **prop)
+            for at, name, prop in zip(atoms_list, name_list, property_list):
+                self._add_system(conn, at, name, **prop)
 
     def get_properties(self, idx):
         """
@@ -327,14 +323,33 @@ class AtomsData(Dataset):
         # extract properties
         properties = {}
         for pname in self.load_only:
-            properties[pname] = torch.FloatTensor(row.data[pname])
+            # new data format
+            try:
+                shape = row.data["_shape_" + pname]
+                dtype = row.data["_dtype_" + pname]
+                prop = np.frombuffer(b64decode(row.data[pname]), dtype=dtype)
+                prop = prop.reshape(shape)
+            except:
+                # fallback for properties stored directly
+                # in the row
+                if pname in row:
+                    prop = row[pname]
+                else:
+                    prop = row.data[pname]
+
+                try:
+                    prop.shape
+                except AttributeError as e:
+                    prop = np.array([prop], dtype=np.float32)
+
+            properties[pname] = torch.FloatTensor(prop)
 
         # extract/calculate structure
         properties = _convert_atoms(
             at,
             environment_provider=self.environment_provider,
             collect_triples=self.collect_triples,
-            centering_function=self.centering_function,
+            center_positions=self.center_positions,
             output=properties,
         )
 
@@ -380,62 +395,12 @@ class AtomsData(Dataset):
             properties = [properties]
         return {p: self._get_atomref(p) for p in properties}
 
-    def _is_deprecated(self):
-        """
-        Check if database is deprecated.
-
-        Returns:
-            (bool): True if ase db is deprecated.
-        """
-        # check if db exists
-        if not os.path.exists(self.dbpath):
-            return False
-
-        # get properties of first atom
-        with connect(self.dbpath) as conn:
-            data = conn.get(1).data
-
-        # check byte style deprecation
-        if True in [pname.startswith("_dtype_") for pname in data.keys()]:
-            return True
-        # fallback for properties stored directly in the row
-        if True in [type(val) != np.ndarray for val in data.values()]:
-            return True
-
-        return False
-
-    def _deprecation_update(self):
-        """
-        Update deprecated database to a valid ase database.
-        """
-        warnings.warn(
-            "The database is deprecated and will be updated automatically. "
-            "The old database is moved to {}.deprecated!".format(self.dbpath)
-        )
-
-        # read old database
-        atoms_list, properties_list = spk.utils.read_deprecated_database(self.dbpath)
-        metadata = self.get_metadata()
-
-        # move old database
-        os.rename(self.dbpath, self.dbpath + ".deprecated")
-
-        # write updated database
-        self.set_metadata(metadata=metadata)
-        with connect(self.dbpath) as conn:
-            for atoms, properties in tqdm(
-                zip(atoms_list, properties_list),
-                "Updating new database",
-                total=len(atoms_list),
-            ):
-                conn.write(atoms, data=properties)
-
 
 def _convert_atoms(
     atoms,
     environment_provider=SimpleEnvironmentProvider(),
     collect_triples=False,
-    centering_function=None,
+    center_positions=False,
     output=None,
 ):
     """
@@ -444,10 +409,7 @@ def _convert_atoms(
         Args:
             atoms (ase.Atoms): Atoms object of molecule
             environment_provider (callable): Neighbor list provider.
-            collect_triples (bool, optional): Set to True if angular features are needed.
-            centering_function (callable or None): Function for calculating center of
-                molecule (center of mass/geometry/...). Center will be subtracted from
-                positions.
+            device (str): Device for computation (default='cpu')
             output (dict): Destination for converted atoms, if not None
 
     Returns:
@@ -464,8 +426,8 @@ def _convert_atoms(
 
     inputs[Properties.Z] = torch.LongTensor(atoms.numbers.astype(np.int))
     positions = atoms.positions.astype(np.float32)
-    if centering_function:
-        positions -= centering_function(atoms)
+    if center_positions:
+        positions -= atoms.get_center_of_mass()
     inputs[Properties.R] = torch.FloatTensor(positions)
     inputs[Properties.cell] = torch.FloatTensor(cell)
 
@@ -502,7 +464,8 @@ class AtomsConverter:
 
     Args:
         environment_provider (callable): Neighbor list provider.
-        collect_triples (bool, optional): Set to True if angular features are needed.
+        pair_provider (callable): Neighbor pair provider (required for angular
+            functions)
         device (str): Device for computation (default='cpu')
     """
 
