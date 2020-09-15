@@ -3,6 +3,7 @@ import sys
 import numpy as np
 import torch
 
+from ray import tune
 
 class Trainer:
     r"""Class to train a model.
@@ -221,6 +222,7 @@ class Trainer:
                         val_batch = {k: v.to(device) for k, v in val_batch.items()}
 
                         val_result = self._model(val_batch)
+
                         val_batch_loss = (
                             self.loss_fn(val_batch, val_result).data.cpu().numpy()
                         )
@@ -235,6 +237,7 @@ class Trainer:
                     # weighted average over batches
                     if self.loss_is_normalized:
                         val_loss /= n_val
+                    print(val_loss)
 
                     if self.best_loss > val_loss:
                         self.best_loss = val_loss
@@ -248,7 +251,10 @@ class Trainer:
 
                 if self._stop:
                     break
-            #
+
+            # tune hyperparameter
+            tune.report(loss=val_loss)
+
             # Training Ends
             #
             # run hooks & store checkpoint
