@@ -263,7 +263,8 @@ class Trainer:
             if self.train_type == "ray_tune":
                 with tune.checkpoint_dir(self.epoch) as checkpoint_dir:
                     path = os.path.join(checkpoint_dir, "ray_tune_checkpoint")
-                    torch.save((self.state_dict(), optimizer.state_dict()), path)
+                    #torch.save((self.state_dict()), path)
+                    torch.save((self.state_dict, self.optimizer.state_dict), path)
                 tune.report(loss=val_loss)
 
             # Training Ends
@@ -272,7 +273,7 @@ class Trainer:
             for h in self.hooks:
                 h.on_train_ends(self)
 
-            if train_type == "train":
+            if self.train_type == "train":
                 self.store_checkpoint()
 
         except Exception as e:
