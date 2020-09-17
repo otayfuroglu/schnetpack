@@ -34,6 +34,7 @@ class Trainer:
         optimizer,
         train_loader,
         validation_loader,
+        train_type="train",
         keep_n_checkpoints=3,
         checkpoint_interval=10,
         validation_interval=1,
@@ -56,15 +57,22 @@ class Trainer:
 
         self.loss_fn = loss_fn
         self.optimizer = optimizer
+        
+        self.train_type = train_type
 
-        if os.path.exists(self.checkpoint_path):
-            self.restore_checkpoint()
-        else:
-            os.makedirs(self.checkpoint_path)
+        if self.train_type == "train":
+            if os.path.exists(self.checkpoint_path):
+                self.restore_checkpoint()
+            else:
+                os.makedirs(self.checkpoint_path)
+                self.epoch = 0
+                self.step = 0
+                self.best_loss = float("inf")
+                self.store_checkpoint()
+        elif self.train_type == "ray_tune":
             self.epoch = 0
             self.step = 0
             self.best_loss = float("inf")
-            self.store_checkpoint()
 
     def _check_is_parallel(self):
         return True if isinstance(self._model, torch.nn.DataParallel) else False
@@ -200,7 +208,7 @@ class Trainer:
                     if self._stop:
                         break
 
-                if self.epoch % self.checkpoint_interval == 0:
+                if self.epoch % self.checkpoint_interval == 0 and self.train_type == "train":
                     self.store_checkpoint()
 
                 # validation
@@ -237,7 +245,6 @@ class Trainer:
                     # weighted average over batches
                     if self.loss_is_normalized:
                         val_loss /= n_val
-                    print(val_loss)
 
                     if self.best_loss > val_loss:
                         self.best_loss = val_loss
@@ -252,15 +259,21 @@ class Trainer:
                 if self._stop:
                     break
 
-            # tune hyperparameter
-            tune.report(loss=val_loss)
+            # tune connection
+            if self.train_type == "ray_tune":
+                with tune.checkpoint_dir(self.epoch) as checkpoint_dir:
+                    path = os.path.join(checkpoint_dir, "ray_tune_checkpoint")
+                    torch.save((self.state_dict(), optimizer.state_dict()), path)
+                tune.report(loss=val_loss)
 
             # Training Ends
             #
             # run hooks & store checkpoint
             for h in self.hooks:
                 h.on_train_ends(self)
-            self.store_checkpoint()
+
+            if train_type == "train":
+                self.store_checkpoint()
 
         except Exception as e:
             for h in self.hooks:
