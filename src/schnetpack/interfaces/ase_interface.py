@@ -15,7 +15,6 @@ import os
 
 from schnetpack.data.atoms import AtomsConverter
 from schnetpack.utils.spk_utils import DeprecationHelper
-from schnetpack import Properties
 
 from ase import units
 from ase.calculators.calculator import Calculator, all_changes
@@ -56,10 +55,9 @@ class SpkCalculator(Calculator):
         **kwargs: Additional arguments for basic ase calculator class
     """
 
-    energy = Properties.energy
-    forces = Properties.forces
-    stress = Properties.stress
-    implemented_properties = [energy, forces, stress]
+    energy = "energy"
+    forces = "forces"
+    implemented_properties = [energy, forces]
 
     def __init__(
         self,
@@ -69,16 +67,13 @@ class SpkCalculator(Calculator):
         environment_provider=SimpleEnvironmentProvider(),
         energy=None,
         forces=None,
-        stress=None,
         energy_units="eV",
         forces_units="eV/Angstrom",
-        stress_units="eV/Angstrom/Angstrom/Angstrom",
         **kwargs
     ):
         Calculator.__init__(self, **kwargs)
 
         self.model = model
-        self.model.to(device)
 
         self.atoms_converter = AtomsConverter(
             environment_provider=environment_provider,
@@ -88,16 +83,10 @@ class SpkCalculator(Calculator):
 
         self.model_energy = energy
         self.model_forces = forces
-        self.model_stress = stress
 
         # Convert to ASE internal units
-        # MDUnits parses the given energy units and converts them to atomic units as the common denominator.
-        # These are then converted to ASE units
         self.energy_units = MDUnits.parse_mdunit(energy_units) * units.Ha
         self.forces_units = MDUnits.parse_mdunit(forces_units) * units.Ha / units.Bohr
-        self.stress_units = (
-            MDUnits.parse_mdunit(stress_units) * units.Ha / units.Bohr ** 3
-        )
 
     def calculate(self, atoms=None, properties=["energy"], system_changes=all_changes):
         """
@@ -125,9 +114,7 @@ class SpkCalculator(Calculator):
                     "properties!".format(self.model_energy)
                 )
             energy = model_results[self.model_energy].cpu().data.numpy()
-            results[self.energy] = (
-                energy.item() * self.energy_units
-            )  # ase calculator should return scalar energy
+            results[self.energy] = energy.reshape(-1) * self.energy_units
 
         if self.model_forces is not None:
             if self.model_forces not in model_results.keys():
@@ -138,23 +125,6 @@ class SpkCalculator(Calculator):
                 )
             forces = model_results[self.model_forces].cpu().data.numpy()
             results[self.forces] = forces.reshape((len(atoms), 3)) * self.forces_units
-
-        if self.model_stress is not None:
-            if atoms.cell.volume <= 0.0:
-                raise SpkCalculatorError(
-                    "Cell with 0 volume encountered for stress computation"
-                )
-
-            if self.model_stress not in model_results.keys():
-                raise SpkCalculatorError(
-                    "'{}' is not a property of your model. Please "
-                    "check the model"
-                    "properties! If desired, stress tensor computation can be "
-                    "activated via schnetpack.utils.activate_stress_computation "
-                    "at ones own risk.".format(self.model_stress)
-                )
-            stress = model_results[self.model_stress].cpu().data.numpy()
-            results[self.stress] = stress.reshape((3, 3)) * self.stress_units
 
         self.results = results
 
@@ -176,6 +146,7 @@ class AseInterface:
         ml_model,
         working_dir,
         device="cpu",
+        collect_triples=False,
         energy="energy",
         forces="forces",
         energy_units="eV",
@@ -200,6 +171,7 @@ class AseInterface:
             energy_units=energy_units,
             forces_units=forces_units,
             environment_provider=environment_provider,
+            collect_triples=collect_triples,
         )
         self.molecule.set_calculator(calculator)
 
