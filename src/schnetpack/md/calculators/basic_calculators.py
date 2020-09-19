@@ -165,7 +165,8 @@ class MDCalculator:
         Args:
             system (schnetpack.md.System): System object containing current state of the simulation.
         """
-        forces = self.results[self.force_handle]
+        #forces = self.results[self.force_handle]
+        forces = self.results[self.force_handle[0]] #edited by omert
         system.forces = (
             forces.view(system.n_replicas, system.n_molecules, system.max_n_atoms, 3)
             * self.force_conversion
