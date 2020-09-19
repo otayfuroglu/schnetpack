@@ -1,7 +1,9 @@
 from schnetpack import Properties
 from schnetpack.md.calculators import MDCalculator
 from schnetpack.md.utils import MDUnits
-
+from schnetpack.environment import SimpleEnvironmentProvider, collect_atom_triples
+import numpy as np
+import torch
 
 class SchnetPackCalculator(MDCalculator):
     """
@@ -25,12 +27,14 @@ class SchnetPackCalculator(MDCalculator):
     def __init__(
         self,
         model,
+        atoms,
         required_properties,
         force_handle,
         position_conversion=1.0 / MDUnits.angs2bohr,
         force_conversion=1.0 / MDUnits.auforces2aseforces,
         property_conversion={},
         detach=True,
+        collect_triples=True,
     ):
         super(SchnetPackCalculator, self).__init__(
             required_properties,
@@ -40,9 +44,11 @@ class SchnetPackCalculator(MDCalculator):
             property_conversion,
             detach,
         )
-
+        
+        self.atoms = atoms
         self.model = model
-
+        self.collect_triples = collect_triples
+        
     def calculate(self, system):
         """
         Main routine, generates a properly formatted input for the schnetpack model from the system, performs the
@@ -66,17 +72,73 @@ class SchnetPackCalculator(MDCalculator):
         Returns:
             dict(torch.Tensor): Schnetpack inputs in dictionary format.
         """
+
+        # If requested get neighbor lists for triples
+        inputs = self._convert_atoms()
+
+        if self.collect_triples:
+            mask_triples = torch.ones_like(inputs[Properties.neighbor_pairs_j])
+            mask_triples[inputs[Properties.neighbor_pairs_j] < 0] = 0
+            mask_triples[inputs[Properties.neighbor_pairs_k] < 0] = 0
+            inputs[Properties.neighbor_pairs_mask] = mask_triples.float()
+            for key, value in inputs.items():
+                inputs[key] = value.unsqueeze(0)
+
         positions, atom_types, atom_masks = self._get_system_molecules(system)
         neighbors, neighbor_mask = self._get_system_neighbors(system)
 
-        inputs = {
-            Properties.R: positions,
-            Properties.Z: atom_types,
-            Properties.atom_mask: atom_masks,
-            Properties.cell: None,
-            Properties.cell_offset: None,
-            Properties.neighbors: neighbors,
-            Properties.neighbor_mask: neighbor_mask,
-        }
+        inputs[Properties.R] = positions
+        inputs[Properties.Z] = atom_types
+        inputs[Properties.atom_mask] = atom_masks
+        inputs[Properties.cell] = None
+        inputs[Properties.cell_offset] = None
+        inputs[Properties.neighbors] = neighbors
+        inputs[Properties.neighbor_mask] = neighbor_mask
+
+        return inputs
+
+    def _convert_atoms(
+        self,
+        centering_function=None,
+        output=None,
+    ):
+        """
+            Helper function to convert ASE atoms object to SchNetPack input format.
+            Args:
+                atoms (ase.Atoms): Atoms object of molecule
+                environment_provider (callable): Neighbor list provider.
+                collect_triples (bool, optional): Set to True if angular features are needed.
+                centering_function (callable or None): Function for calculating center of
+                    molecule (center of mass/geometry/...). Center will be subtracted from
+                    positions.
+                output (dict): Destination for converted atoms, if not None
+        Returns:
+            dict of torch.Tensor: Properties including neighbor lists and masks
+                reformated into SchNetPack input format.
+        """
+        if output is None:
+            inputs = {}
+        else:
+            inputs = output
+
+
+        # get atom environment
+        environment_provider=SimpleEnvironmentProvider()
+        nbh_idx, offsets = environment_provider.get_environment(self.atoms)
+
+
+
+        # If requested get neighbor lists for triples
+        if self.collect_triples:
+            nbh_idx_j, nbh_idx_k, offset_idx_j, offset_idx_k = collect_atom_triples(nbh_idx)
+            inputs[Properties.neighbor_pairs_j] = torch.LongTensor(nbh_idx_j.astype(np.int))
+            inputs[Properties.neighbor_pairs_k] = torch.LongTensor(nbh_idx_k.astype(np.int))
+
+            inputs[Properties.neighbor_offsets_j] = torch.LongTensor(
+                offset_idx_j.astype(np.int)
+            )
+            inputs[Properties.neighbor_offsets_k] = torch.LongTensor(
+                offset_idx_k.astype(np.int)
+            )
 
         return inputs
